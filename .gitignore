@@ -19,10 +19,6 @@ env/
 
 # ── Sensitive / generated files ───────────────────────────────────────────────
 
-# Eval dataset — NEVER commit, must stay secret
-eval_dataset/
-evaluator/eval_dataset/
-
 # Participant labels — committed intentionally in participant_kit/ only
 # but NOT in other locations
 /labels.npy
