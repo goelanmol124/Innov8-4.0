@@ -1,0 +1,7 @@
+{
+  "team_name":   "Your Team Name",
+  "team_id":     "your_unstop_id",
+  "institution": "Your College / Company",
+  "members":     ["Member 1", "Member 2", "Member 3"],
+  "entry_point": "agent.py"
+}

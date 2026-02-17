@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# ── Sensitive / generated files ───────────────────────────────────────────────
+
+# Eval dataset — NEVER commit, must stay secret
+eval_dataset/
+evaluator/eval_dataset/
+
+# Participant labels — committed intentionally in participant_kit/ only
+# but NOT in other locations
+/labels.npy
+
+# Evaluation results — may contain team info; don't commit by default
+evaluator/results.csv
+evaluator/leaderboard*.csv
+
+# Submission ZIPs dropped in for grading
+evaluator/submissions/*.zip
+
+# ── OS / editor ───────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
