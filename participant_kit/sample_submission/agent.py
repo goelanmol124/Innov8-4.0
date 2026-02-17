@@ -7,13 +7,15 @@ This is a reference implementation that demonstrates a competitive strategy.
 You are free to use, modify, or completely replace it.
 
 Strategy (two-stage active learning):
-  Stage 1 — Explore  (40 queries)
+  Stage 1 — Explore  (up to 40 queries)
     Query rows that score highly on each of the four fraud dimensions:
     credential fraud signals, application bombing signals,
     account-takeover signals, and ghost-profile signals.
+    Top-8 rows per dimension are unioned (deduplication may reduce this),
+    plus up to 8 random rows to anchor the legitimate distribution.
     This seeds each fraud cluster with labeled examples.
 
-  Stage 2 — Exploit  (remaining budget ≤ 60 queries)
+  Stage 2 — Exploit  (remaining budget, up to ~60 queries)
     Train a Gradient Boosted tree on the Stage-1 labels.
     Query the rows with the highest predicted fraud probability that
     haven't been labeled yet.  This densifies coverage of the clusters

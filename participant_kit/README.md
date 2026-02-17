@@ -82,7 +82,7 @@ def run_agent(df: pd.DataFrame, oracle_fn, budget: int) -> np.ndarray:
 
                 Raises BudgetExceededError if the TOTAL number of indices
                 across ALL calls to oracle_fn exceeds `budget`.
-                BudgetExceededError is a subclass of RuntimeError.
+                BudgetExceededError is a subclass of Exception.
 
     budget    : int — maximum oracle queries available (100 in final evaluation)
 
