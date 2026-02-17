@@ -1,9 +1,15 @@
-# Innov8 4.0 — Fraud Detection Challenge
+# Innov8 4.0 — Talent Fraud Detection Challenge
+### Sponsored by [Eightfold AI](https://eightfold.ai)
 
 ## The Problem: Active Learning with a Limited Oracle
 
-You are given a dataset of **10,000 financial transactions** (features only, no labels).
-Your task is to build a classifier that identifies which transactions are fraudulent.
+Eightfold AI's talent intelligence platform processes millions of candidate
+profiles and job applications globally. A small fraction of these are
+**fraudulent** — fake credentials, inflated experience, bot-driven spam
+applications, and hijacked accounts.
+
+You are given a dataset of **10,000 candidate profiles** (features only, no labels).
+Your task is to build a classifier that identifies which profiles are fraudulent.
 
 **Constraint:** you may query the ground-truth label for at most **100 rows**.
 Every label query costs one unit of budget. How you allocate that budget determines your score.
@@ -16,30 +22,39 @@ Every label query costs one unit of budget. How you allocate that budget determi
 
 | Feature | Type | Description |
 |---|---|---|
-| `amount` | float | Transaction amount (USD) |
-| `amount_log` | float | log(1 + amount) |
-| `hour` | int 0–23 | Hour of day the transaction occurred |
-| `day_of_week` | int 0–6 | Day of week (0 = Monday) |
-| `user_account_age_days` | int | Days since the account was created |
-| `card_age_days` | int | Days since the card was issued |
-| `txn_count_7d` | int | Transaction count by this user in the last 7 days |
-| `txn_count_30d` | int | Transaction count by this user in the last 30 days |
-| `avg_amount_30d` | float | Average transaction amount over the last 30 days |
-| `std_amount_30d` | float | Std deviation of transaction amount over the last 30 days |
-| `amount_to_avg_ratio` | float | `amount / avg_amount_30d` |
-| `failed_auths_24h` | int 0–4 | Failed authentication attempts in the last 24 hours |
-| `is_new_device` | int 0/1 | 1 if device was not previously seen for this account |
-| `is_international` | int 0/1 | 1 if the transaction crosses a national border |
-| `distance_km` | float | Distance from the account's registered home location |
+| `profile_age_days` | int | Days since the candidate profile was created |
+| `applications_7d` | int | Number of job applications submitted in the last 7 days |
+| `applications_30d` | int | Number of job applications submitted in the last 30 days |
+| `avg_applications_30d` | float | Historical average daily applications over the last 30 days |
+| `app_to_avg_ratio` | float | `applications_30d / (avg_applications_30d × 30)` |
+| `skills_count` | int | Number of skills listed on the profile |
+| `endorsements_count` | int | Number of skill endorsements received |
+| `experience_years` | float | Total claimed years of work experience |
+| `skills_to_exp_ratio` | float | `skills_count / (experience_years + 1)` |
+| `institution_risk_score` | float 0–1 | Risk score for the listed educational institution(s) |
+| `company_risk_score` | float 0–1 | Risk score for the listed employer(s) |
+| `gpa_anomaly_score` | float 0–1 | How anomalous the claimed GPA is vs. the institution (0 = plausible, 1 = very suspicious) |
+| `tenure_gap_months` | float | Total unexplained employment gaps (months) |
+| `avg_tenure_months` | float | Average tenure per job role |
+| `time_since_last_app_hrs` | float | Hours elapsed since the previous job application |
+| `is_new_device` | int 0/1 | 1 if the login device was not previously seen for this account |
 | `ip_risk_score` | float 0–1 | Risk score of the originating IP address |
 | `email_risk_score` | float 0–1 | Risk score of the account email address |
-| `merchant_risk_category` | int 0–4 | Merchant risk tier (0 = lowest, 4 = highest) |
-| `time_since_last_txn_hrs` | float | Hours elapsed since the previous transaction |
-| `device_os_encoded` | int 0–4 | Device operating system (encoded) |
-| `browser_encoded` | int 0–7 | Browser (encoded) |
+| `login_velocity_24h` | int | Number of logins in the last 24 hours |
+| `failed_logins_24h` | int 0–5 | Failed login attempts in the last 24 hours |
+| `copy_paste_ratio` | float 0–1 | Fraction of profile text that appears copy-pasted from other profiles |
 | `feature_noise_1–4` | mixed | Uninformative noise features |
 
-Overall fraud rate: **approximately 8%** (≈800 fraud out of 10,000 rows).
+Overall fraud rate: **approximately 8%** (≈800 fraudulent profiles out of 10,000).
+
+### Fraud types in the dataset
+
+| Type | Description | Key signals |
+|---|---|---|
+| **Credential Fraud** | Fake degrees, ghost companies, implausible GPAs | `institution_risk_score`, `gpa_anomaly_score`, `company_risk_score`, `tenure_gap_months` |
+| **Application Bombing** | Bots mass-applying to every open role | `applications_7d`, `applications_30d`, `app_to_avg_ratio`, `time_since_last_app_hrs` |
+| **Account Takeover** | Attacker hijacks a legitimate profile | `is_new_device`, `failed_logins_24h`, `login_velocity_24h`, `email_risk_score` |
+| **Ghost Profile** | Freshly fabricated synthetic identity | `profile_age_days`, `copy_paste_ratio`, `skills_to_exp_ratio` |
 
 ---
 
@@ -63,7 +78,7 @@ def run_agent(df: pd.DataFrame, oracle_fn, budget: int) -> np.ndarray:
                 oracle_fn(indices: list[int]) -> list[int]
                     indices  — list of row indices to query (0-based)
                     returns  — list of int labels, same length, values in {0, 1}
-                               0 = legitimate, 1 = fraud
+                               0 = legitimate candidate, 1 = fraudulent
 
                 Raises BudgetExceededError if the TOTAL number of indices
                 across ALL calls to oracle_fn exceeds `budget`.
@@ -255,7 +270,8 @@ The **final evaluation uses a different dataset** (same features, different rand
 - **Random sampling gives ~8 fraud in 100 queries.** That's the same rate as the overall dataset.
   A smart strategy can yield 30–50 fraud in 100 queries — a 4–6× improvement in labeled fraud density.
 
-- **The fraud data has cluster structure.** Different fraud types leave different feature fingerprints.
+- **The fraud data has cluster structure.** Four distinct fraud types leave different feature fingerprints:
+  credential fraud, application bombing, account takeover, and ghost profiles.
   Spending your budget to find these clusters is far more valuable than sampling uniformly.
 
 - **Explore then exploit.** Start with diverse queries to discover fraud patterns,

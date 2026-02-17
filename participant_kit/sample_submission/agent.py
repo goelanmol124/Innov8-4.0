@@ -1,13 +1,16 @@
 """
-Sample Submission — Active-Learning Fraud Detector
-====================================================
+Sample Submission — Active-Learning Talent Fraud Detector
+==========================================================
+Sponsored problem by Eightfold AI.
+
 This is a reference implementation that demonstrates a competitive strategy.
 You are free to use, modify, or completely replace it.
 
 Strategy (two-stage active learning):
   Stage 1 — Explore  (40 queries)
-    Query rows that score highly on each of the four anomaly dimensions:
-    high-risk IP, velocity anomalies, account-takeover signals, new-account signals.
+    Query rows that score highly on each of the four fraud dimensions:
+    credential fraud signals, application bombing signals,
+    account-takeover signals, and ghost-profile signals.
     This seeds each fraud cluster with labeled examples.
 
   Stage 2 — Exploit  (remaining budget ≤ 60 queries)
@@ -45,25 +48,28 @@ def _anomaly_scores(df: pd.DataFrame) -> np.ndarray:
     Each score is high when the row looks like that cluster's fraud type.
     No label information is used — these are computed from features only.
     """
-    # C1: high-value international (ip_risk + is_international + distance)
-    c1 = (df["ip_risk_score"]
-          + df["is_international"]
-          + df["distance_km"] / 200.0)
+    # C1: credential fraud (risky institution/company, suspicious GPA, large gaps)
+    c1 = (df["institution_risk_score"]
+          + df["gpa_anomaly_score"]
+          + df["company_risk_score"]
+          + df["tenure_gap_months"] / 20.0)
 
-    # C2: card-testing velocity (many txns, tiny amounts, back-to-back)
-    c2 = (df["txn_count_7d"] / 10.0
-          + df["txn_count_30d"] / 30.0
-          - df["time_since_last_txn_hrs"])
+    # C2: application bombing (extreme velocity, near-zero idle time)
+    c2 = (df["applications_7d"] / 10.0
+          + df["applications_30d"] / 30.0
+          + df["app_to_avg_ratio"]
+          - df["time_since_last_app_hrs"])
 
-    # C3: account takeover (new device + email risk + failed auths)
+    # C3: account takeover (new device + failed logins + high login velocity)
     c3 = (df["email_risk_score"]
           + df["is_new_device"]
-          + df["failed_auths_24h"])
+          + df["failed_logins_24h"]
+          + df["login_velocity_24h"] / 5.0)
 
-    # C4: new-account fraud (high merchant risk + fresh account + fresh card)
-    c4 = (df["merchant_risk_category"] / 2.0
-          - df["user_account_age_days"] / 100.0
-          - df["card_age_days"] / 100.0)
+    # C4: ghost profile (brand-new account + high copy-paste + skill inflation)
+    c4 = (df["copy_paste_ratio"]
+          + df["skills_to_exp_ratio"] / 10.0
+          - df["profile_age_days"] / 500.0)
 
     return np.stack([c1.values, c2.values, c3.values, c4.values], axis=1)
 
@@ -99,12 +105,13 @@ def run_agent(df: pd.DataFrame, oracle_fn, budget: int) -> np.ndarray:
     df        : pd.DataFrame, shape (n, n_features) — the full unlabelled dataset
     oracle_fn : callable(indices: list[int]) -> list[int]
                 Returns binary labels (0/1) for the requested row indices.
+                0 = legitimate candidate, 1 = fraudulent.
                 Raises BudgetExceededError if you exceed `budget` total queries.
     budget    : int — maximum oracle calls allowed (typically 100)
 
     Returns
     -------
-    predictions : np.ndarray of int, shape (n,) — 0 = legit, 1 = fraud
+    predictions : np.ndarray of int, shape (n,) — 0 = legitimate, 1 = fraud
     """
     n = len(df)
     rng = np.random.default_rng(42)
@@ -125,7 +132,7 @@ def run_agent(df: pd.DataFrame, oracle_fn, budget: int) -> np.ndarray:
         top = np.argsort(-scores[:, dim])[:explore_per_dim]
         stage1_idx.update(top.tolist())
 
-    # A few diverse random rows to anchor the legit distribution
+    # A few diverse random rows to anchor the legitimate distribution
     random_pool = [i for i in range(n) if i not in stage1_idx]
     n_random = min(8, budget - len(stage1_idx))
     stage1_idx.update(rng.choice(random_pool, size=n_random, replace=False).tolist())
@@ -145,7 +152,7 @@ def run_agent(df: pd.DataFrame, oracle_fn, budget: int) -> np.ndarray:
         proba1 = model1.predict_proba(X_scaled)[:, 1]
 
         not_queried = np.array([i for i in range(n) if i not in set(labeled_idx)])
-        # Query the rows the model thinks are most likely fraud
+        # Query the rows the model thinks are most likely fraudulent
         exploit_idx = not_queried[np.argsort(-proba1[not_queried])[:remaining]]
         labels_stage2 = oracle_fn(exploit_idx.tolist())
         labeled_idx.extend(exploit_idx.tolist())

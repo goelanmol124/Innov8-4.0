@@ -1,14 +1,21 @@
 """
-Synthetic fraud detection dataset generator.
+Synthetic talent-fraud detection dataset generator.
+Sponsored problem by Eightfold AI.
 
 Usage:
     python generate.py --split participant --seed 42 --output-dir ../participant_kit
     python generate.py --split eval      --seed 99 --output-dir ../eval_dataset
 
+Domain
+------
+Eightfold AI's talent platform processes millions of candidate profiles and
+job applications. A small fraction of these are fraudulent — fake credentials,
+inflated experience, bot-generated spam applications, and hijacked accounts.
+
 Design rationale
 ----------------
 Each fraud cluster shifts ONLY 3-4 features from the legitimate baseline.
-Non-signal features remain at the SAME distribution as legitimate transactions,
+Non-signal features remain at the SAME distribution as legitimate profiles,
 so no single feature is a strong global discriminator.
 
 Within each cluster, the signal features ARE strongly shifted (within-cluster
@@ -20,12 +27,19 @@ AUC 0.85-0.97 vs legit). This means:
 
 Global (per-feature) AUC stays low (≤ 0.72) because each feature is elevated
 for at most 1 cluster (25-30% of all fraud); the remaining fraud look like
-legitimate in that feature.
+legitimate profiles in that feature.
 
 CRITICAL: Each cluster's signal features are COMPLETELY NON-OVERLAPPING.
 This is what creates the sharp gradient: random sampling yields ~2 fraud per
 cluster, which is not enough to learn any cluster reliably. Smart active learning
 that finds 10+ per cluster unlocks all four detection patterns simultaneously.
+
+Fraud clusters
+--------------
+  C1 — Credential Fraud        : fake degrees / ghost companies
+  C2 — Application Bombing     : bot-driven mass-apply spam
+  C3 — Account Takeover        : hijacked legitimate profile
+  C4 — Ghost Profile / Synthetic Identity : freshly fabricated identity
 """
 
 import numpy as np
@@ -33,14 +47,16 @@ import pandas as pd
 from pathlib import Path
 
 FEATURES = [
-    "amount", "amount_log", "hour", "day_of_week",
-    "user_account_age_days", "card_age_days",
-    "txn_count_7d", "txn_count_30d",
-    "avg_amount_30d", "std_amount_30d", "amount_to_avg_ratio",
-    "failed_auths_24h", "is_new_device", "is_international",
-    "distance_km", "ip_risk_score", "email_risk_score",
-    "merchant_risk_category", "time_since_last_txn_hrs",
-    "device_os_encoded", "browser_encoded",
+    "profile_age_days", "applications_7d", "applications_30d",
+    "avg_applications_30d", "app_to_avg_ratio",
+    "skills_count", "endorsements_count",
+    "experience_years", "skills_to_exp_ratio",
+    "institution_risk_score", "company_risk_score",
+    "gpa_anomaly_score", "tenure_gap_months", "avg_tenure_months",
+    "time_since_last_app_hrs",
+    "is_new_device", "ip_risk_score", "email_risk_score",
+    "login_velocity_24h", "failed_logins_24h",
+    "copy_paste_ratio",
     "feature_noise_1", "feature_noise_2", "feature_noise_3", "feature_noise_4",
 ]
 
@@ -49,52 +65,42 @@ FEATURES = [
 
 def _base(rng, n):
     """
-    Legitimate-user feature distributions. Both legit rows AND the
+    Legitimate-candidate feature distributions. Both legit rows AND the
     non-signal features of fraud rows are drawn from this.
     """
-    hour_pool = np.concatenate([
-        rng.integers(8, 12,  size=int(n * 0.35)),
-        rng.integers(12, 19, size=int(n * 0.35)),
-        rng.integers(19, 23, size=int(n * 0.20)),
-        rng.integers(0, 24,  size=n - int(n * 0.90)),
-    ])
-    rng.shuffle(hour_pool)
+    avg_apps = rng.lognormal(mean=1.2, sigma=0.8, size=n).clip(0.1, 30)
+    apps_7d  = rng.integers(0, 8, size=n)
+    apps_30d = apps_7d + rng.integers(0, 20, size=n)
 
-    # Card age: 30% recently issued, 70% established
-    fresh    = rng.random(n) < 0.30
-    card_age = np.where(fresh, rng.integers(1, 300, n), rng.integers(300, 1800, n))
-
-    amt     = rng.lognormal(mean=3.5, sigma=1.8, size=n).clip(0.5, 10000)
-    avg_amt = rng.lognormal(mean=3.5, sigma=1.3, size=n).clip(0.5, 5000)
+    exp_yrs  = rng.lognormal(mean=1.8, sigma=0.9, size=n).clip(0, 40)
+    skills   = (exp_yrs * rng.uniform(1.5, 3.0, size=n) + rng.integers(0, 10, size=n)).clip(1, 80)
 
     return {
-        "amount":                  amt,
-        "amount_log":              np.log1p(amt),
-        "hour":                    hour_pool[:n],
-        "day_of_week":             rng.integers(0, 7,    size=n),
-        "user_account_age_days":   rng.integers(1, 3650, size=n),
-        "card_age_days":           card_age,
-        "txn_count_7d":            rng.integers(1, 25,   size=n),
-        "txn_count_30d":           rng.integers(3, 80,   size=n),
-        "avg_amount_30d":          avg_amt,
-        "std_amount_30d":          rng.exponential(scale=30, size=n).clip(0, 350),
-        "amount_to_avg_ratio":     amt / (avg_amt + 1),
-        # Beta(1.5,5) → mean≈0.23, spreads [0,1] but mostly low
-        "ip_risk_score":           rng.beta(1.5, 5.0, size=n),
-        "email_risk_score":        rng.beta(1.5, 5.0, size=n),
-        # Poisson(0.3) → ~74% zero, ~22% one, ~4% two+
-        "failed_auths_24h":        rng.poisson(lam=0.3, size=n).clip(0, 4),
-        "is_new_device":           (rng.random(n) < 0.20).astype(int),
-        "is_international":        (rng.random(n) < 0.25).astype(int),
-        "distance_km":             rng.exponential(scale=50, size=n).clip(0, 4000),
-        "merchant_risk_category":  rng.choice(5, p=[0.35, 0.30, 0.20, 0.10, 0.05], size=n),
-        "time_since_last_txn_hrs": rng.lognormal(mean=2.0, sigma=1.5, size=n).clip(0.01, 720),
-        "device_os_encoded":       rng.integers(0, 5, size=n),
-        "browser_encoded":         rng.integers(0, 8, size=n),
-        "feature_noise_1":         rng.standard_normal(size=n),
-        "feature_noise_2":         rng.standard_normal(size=n),
-        "feature_noise_3":         rng.integers(0, 100, size=n).astype(float),
-        "feature_noise_4":         rng.uniform(size=n),
+        "profile_age_days":       rng.integers(30, 3650, size=n),
+        "applications_7d":        apps_7d,
+        "applications_30d":       apps_30d,
+        "avg_applications_30d":   avg_apps,
+        "app_to_avg_ratio":       apps_30d / (avg_apps * 30 + 1),
+        "skills_count":           skills.astype(int),
+        "endorsements_count":     rng.integers(0, 60, size=n),
+        "experience_years":       exp_yrs.round(1),
+        "skills_to_exp_ratio":    (skills / (exp_yrs + 1)).round(3),
+        "institution_risk_score": rng.beta(1.5, 5.0, size=n),        # mostly low
+        "company_risk_score":     rng.beta(1.5, 5.0, size=n),
+        "gpa_anomaly_score":      rng.beta(1.5, 5.0, size=n),        # 0=plausible, 1=very suspicious
+        "tenure_gap_months":      rng.exponential(scale=3, size=n).clip(0, 60).round(1),
+        "avg_tenure_months":      rng.lognormal(mean=3.0, sigma=0.7, size=n).clip(1, 120).round(1),
+        "time_since_last_app_hrs":rng.lognormal(mean=3.5, sigma=1.5, size=n).clip(0.1, 720).round(2),
+        "is_new_device":          (rng.random(n) < 0.15).astype(int),
+        "ip_risk_score":          rng.beta(1.5, 5.0, size=n),
+        "email_risk_score":       rng.beta(1.5, 5.0, size=n),
+        "login_velocity_24h":     rng.poisson(lam=1.5, size=n).clip(0, 20),
+        "failed_logins_24h":      rng.poisson(lam=0.3, size=n).clip(0, 5),
+        "copy_paste_ratio":       rng.beta(2.0, 6.0, size=n),        # mostly low
+        "feature_noise_1":        rng.standard_normal(size=n),
+        "feature_noise_2":        rng.standard_normal(size=n),
+        "feature_noise_3":        rng.integers(0, 100, size=n).astype(float),
+        "feature_noise_4":        rng.uniform(size=n),
     }
 
 
@@ -106,111 +112,120 @@ def _gen_legit(rng, n):
 
 def _gen_cluster1(rng, n):
     """
-    High-value international fraud.
-    EXCLUSIVE signals: amount ↑↑, is_international ↑↑, distance_km ↑↑, ip_risk_score ↑↑.
-    PARTIAL PREVALENCE: only 60% of C1 fraud rows have these signals elevated.
-    The remaining 40% draw from the base (legit) distribution, making them
-    indistinguishable from legitimate transactions on individual features.
+    Credential Fraud: fake degrees, unverifiable institutions, ghost companies.
+    EXCLUSIVE signals: institution_risk_score ↑↑, gpa_anomaly_score ↑↑,
+                       company_risk_score ↑↑, tenure_gap_months ↑↑.
+    PARTIAL PREVALENCE: 60% of C1 fraud rows carry these signals.
 
-    This requires ~10+ labeled C1 samples to reliably detect the cluster;
-    with only 2 samples, expected 1.2 have the signal — not enough to generalise.
+    Fraudsters claim prestigious institutions/companies that don't check out.
+    Their GPAs are suspiciously perfect, and employment history has large gaps.
 
-    Global AUC (30% cluster weight, 60% prevalence):
-        each feature ≈ 0.30×0.60×0.90 + 0.70×0.50 + 0.30×0.40×0.50 ≈ 0.57
-    NO overlap with C2/C3/C4 signals.
+    Global AUC ≈ 0.57; NO overlap with C2/C3/C4 signals.
     """
     d   = _base(rng, n)
-    sig = rng.random(n) < 0.60  # only 60% have the cluster signal
+    sig = rng.random(n) < 0.60
 
-    amt                        = np.where(sig,
-                                          rng.lognormal(mean=6.0, sigma=1.0, size=n).clip(200, 30000),
-                                          d["amount"])
-    d["amount"]                = amt
-    d["amount_log"]            = np.log1p(amt)
-    d["amount_to_avg_ratio"]   = amt / (d["avg_amount_30d"] + 1)
-    d["is_international"]      = np.where(sig,
-                                          (rng.random(n) < 0.92).astype(int),
-                                          d["is_international"])
-    d["distance_km"]           = np.where(sig,
-                                          rng.exponential(scale=600, size=n).clip(0, 4000),
-                                          d["distance_km"])
-    d["ip_risk_score"]         = np.where(sig,
-                                          rng.beta(6.0, 3.0, size=n),   # mean≈0.67
-                                          d["ip_risk_score"])
+    d["institution_risk_score"] = np.where(sig,
+                                           rng.beta(7.0, 2.5, size=n),   # mean≈0.74
+                                           d["institution_risk_score"])
+    d["gpa_anomaly_score"]      = np.where(sig,
+                                           rng.beta(6.5, 2.5, size=n),   # mean≈0.72
+                                           d["gpa_anomaly_score"])
+    d["company_risk_score"]     = np.where(sig,
+                                           rng.beta(6.0, 3.0, size=n),   # mean≈0.67
+                                           d["company_risk_score"])
+    d["tenure_gap_months"]      = np.where(sig,
+                                           rng.exponential(scale=18, size=n).clip(6, 60),
+                                           d["tenure_gap_months"])
     return d
 
 
 def _gen_cluster2(rng, n):
     """
-    Card testing: micro-amounts, extreme velocity, back-to-back transactions.
-    EXCLUSIVE signals: amount ↓↓, txn_count_7d ↑↑, txn_count_30d ↑↑, time_since ↓↓.
-    PARTIAL PREVALENCE: 60% of C2 fraud rows have these signals.
+    Application Bombing: bots or click-farms mass-applying to every open role.
+    EXCLUSIVE signals: applications_7d ↑↑, applications_30d ↑↑,
+                       app_to_avg_ratio ↑↑, time_since_last_app_hrs ↓↓.
+    PARTIAL PREVALENCE: 60% of C2 fraud rows carry these signals.
 
-    Global AUC (25% cluster weight, 60% prevalence):
-        each feature ≈ 0.25×0.60×0.95 + 0.75×0.50 + 0.25×0.40×0.50 ≈ 0.57
-    NO overlap with C1/C3/C4 signals.
+    Bot accounts send dozens of applications per day with near-zero idle time.
+
+    Global AUC ≈ 0.57; NO overlap with C1/C3/C4 signals.
     """
     d   = _base(rng, n)
     sig = rng.random(n) < 0.60
 
-    amt                          = np.where(sig, rng.uniform(0.5, 12, size=n), d["amount"])
-    d["amount"]                  = amt
-    d["amount_log"]              = np.log1p(amt)
-    d["amount_to_avg_ratio"]     = amt / (d["avg_amount_30d"] + 1)
-    d["txn_count_7d"]            = np.where(sig, rng.integers(40, 150, size=n), d["txn_count_7d"])
-    d["txn_count_30d"]           = np.where(sig, rng.integers(120, 400, size=n), d["txn_count_30d"])
-    d["time_since_last_txn_hrs"] = np.where(sig,
-                                            rng.uniform(0.005, 0.25, size=n),
-                                            d["time_since_last_txn_hrs"])
+    apps_7d  = np.where(sig, rng.integers(40, 150, size=n), d["applications_7d"])
+    apps_30d = np.where(sig, rng.integers(120, 450, size=n), d["applications_30d"])
+    d["applications_7d"]          = apps_7d
+    d["applications_30d"]         = apps_30d
+    d["app_to_avg_ratio"]         = np.where(sig,
+                                             apps_30d / (d["avg_applications_30d"] * 30 + 1),
+                                             d["app_to_avg_ratio"])
+    d["time_since_last_app_hrs"]  = np.where(sig,
+                                             rng.uniform(0.005, 0.5, size=n),
+                                             d["time_since_last_app_hrs"])
     return d
 
 
 def _gen_cluster3(rng, n):
     """
-    Account takeover: new device, high email risk, repeated failed auths.
-    EXCLUSIVE signals: is_new_device ↑↑, email_risk_score ↑↑, failed_auths_24h ↑↑.
-    PARTIAL PREVALENCE: 60% of C3 fraud rows have these signals.
+    Account Takeover: attacker hijacks a legitimate candidate's profile to
+    apply for roles (or extract recruiter contacts / salary data).
+    EXCLUSIVE signals: is_new_device ↑↑, failed_logins_24h ↑↑,
+                       login_velocity_24h ↑↑, email_risk_score ↑↑.
+    PARTIAL PREVALENCE: 60% of C3 fraud rows carry these signals.
 
-    Global AUC (25% cluster weight, 60% prevalence):
-        each feature ≈ 0.25×0.60×0.92 + 0.75×0.50 + 0.25×0.40×0.50 ≈ 0.56
-    NO overlap with C1/C2/C4 signals (ip_risk stays at base).
+    Attackers log in from unfamiliar devices, fail auth several times,
+    and then interact at high velocity once in.
+
+    Global AUC ≈ 0.56; NO overlap with C1/C2/C4 signals.
     """
     d   = _base(rng, n)
     sig = rng.random(n) < 0.60
 
-    d["is_new_device"]    = np.where(sig, (rng.random(n) < 0.95).astype(int), d["is_new_device"])
-    d["email_risk_score"] = np.where(sig, rng.beta(7.0, 2.5, size=n), d["email_risk_score"])
-    d["failed_auths_24h"] = np.where(sig,
-                                     rng.poisson(lam=3.0, size=n).clip(0, 4),
-                                     d["failed_auths_24h"])
+    d["is_new_device"]      = np.where(sig, (rng.random(n) < 0.95).astype(int), d["is_new_device"])
+    d["failed_logins_24h"]  = np.where(sig,
+                                       rng.poisson(lam=3.5, size=n).clip(0, 5),
+                                       d["failed_logins_24h"])
+    d["login_velocity_24h"] = np.where(sig,
+                                       rng.integers(10, 40, size=n),
+                                       d["login_velocity_24h"])
+    d["email_risk_score"]   = np.where(sig,
+                                       rng.beta(7.0, 2.5, size=n),    # mean≈0.74
+                                       d["email_risk_score"])
     return d
 
 
 def _gen_cluster4(rng, n):
     """
-    New-account fraud: fresh identity, immediate high-risk purchase.
-    EXCLUSIVE signals: merchant_risk_category ↑↑, user_account_age_days ↓↓, card_age_days ↓↓.
-    PARTIAL PREVALENCE: 60% of C4 fraud rows have these signals.
+    Ghost Profile / Synthetic Identity: a freshly-created fake account with
+    an implausibly polished profile (copy-pasted text, inflated skills list).
+    EXCLUSIVE signals: profile_age_days ↓↓, copy_paste_ratio ↑↑,
+                       skills_to_exp_ratio ↑↑ (too many skills for claimed exp).
+    PARTIAL PREVALENCE: 60% of C4 fraud rows carry these signals.
 
-    Global AUC (20% cluster weight, 60% prevalence):
-        each feature ≈ 0.20×0.60×0.93 + 0.80×0.50 + 0.20×0.40×0.50 ≈ 0.55
-    NO overlap with C1/C2/C3 signals (is_new_device, email_risk stay at base).
+    New fake profiles appear highly complete but the ratio of claimed skills
+    to experience is statistically abnormal, and profile text is recycled.
+
+    Global AUC ≈ 0.55; NO overlap with C1/C2/C3 signals.
     """
     d   = _base(rng, n)
     sig = rng.random(n) < 0.60
 
-    d["merchant_risk_category"] = np.where(sig,
-                                            rng.choice([3, 4], p=[0.45, 0.55], size=n),
-                                            d["merchant_risk_category"])
+    # Very fresh account
+    new_profile = rng.random(n) < 0.95
+    young_days  = np.where(new_profile, rng.integers(1, 14, size=n), rng.integers(14, 90, size=n))
+    d["profile_age_days"]     = np.where(sig, young_days, d["profile_age_days"])
 
-    new_acct = rng.random(n) < 0.95
-    young_acct = np.where(new_acct, rng.integers(1, 14, size=n), rng.integers(14, 365, size=n))
-    d["user_account_age_days"]  = np.where(sig, young_acct, d["user_account_age_days"])
+    # Suspiciously high copy-paste ratio
+    d["copy_paste_ratio"]     = np.where(sig,
+                                         rng.beta(7.0, 2.5, size=n),   # mean≈0.74
+                                         d["copy_paste_ratio"])
 
-    new_card = rng.random(n) < 0.95
-    young_card = np.where(new_card, rng.integers(1, 21, size=n), rng.integers(21, 365, size=n))
-    d["card_age_days"]          = np.where(sig, young_card, d["card_age_days"])
-
+    # Many skills relative to thin experience
+    d["skills_to_exp_ratio"]  = np.where(sig,
+                                         rng.lognormal(mean=3.5, sigma=0.6, size=n).clip(15, 80),
+                                         d["skills_to_exp_ratio"])
     return d
 
 
@@ -221,16 +236,16 @@ def generate_dataset(n: int = 10_000, fraud_rate: float = 0.08, seed: int = 42):
     Returns
     -------
     df     : pd.DataFrame (n, 25) — features only, NO label column
-    labels : np.ndarray  (n,)    — 0 = legitimate, 1 = fraud
+    labels : np.ndarray  (n,)    — 0 = legitimate candidate, 1 = fraudulent
     """
     rng     = np.random.default_rng(seed)
     n_fraud = int(n * fraud_rate)
     n_legit = n - n_fraud
 
-    c1 = int(n_fraud * 0.30)
-    c2 = int(n_fraud * 0.25)
-    c3 = int(n_fraud * 0.25)
-    c4 = n_fraud - c1 - c2 - c3
+    c1 = int(n_fraud * 0.30)   # credential fraud
+    c2 = int(n_fraud * 0.25)   # application bombing
+    c3 = int(n_fraud * 0.25)   # account takeover
+    c4 = n_fraud - c1 - c2 - c3  # ghost profile
 
     blocks = [
         (_gen_legit(rng, n_legit), 0),
@@ -244,7 +259,7 @@ def generate_dataset(n: int = 10_000, fraud_rate: float = 0.08, seed: int = 42):
     for data, lbl in blocks:
         for f in FEATURES:
             cols[f].append(data[f])
-        labels.append(np.full(len(data["amount"]), lbl, dtype=int))
+        labels.append(np.full(len(data["profile_age_days"]), lbl, dtype=int))
 
     for f in FEATURES:
         cols[f] = np.concatenate(cols[f])
@@ -255,10 +270,10 @@ def generate_dataset(n: int = 10_000, fraud_rate: float = 0.08, seed: int = 42):
     labels = labels[perm]
 
     int_cols = [
-        "hour", "day_of_week", "user_account_age_days", "card_age_days",
-        "txn_count_7d", "txn_count_30d", "failed_auths_24h",
-        "is_new_device", "is_international", "merchant_risk_category",
-        "device_os_encoded", "browser_encoded",
+        "profile_age_days", "applications_7d", "applications_30d",
+        "skills_count", "endorsements_count",
+        "login_velocity_24h", "failed_logins_24h",
+        "is_new_device",
     ]
     for c in int_cols:
         df[c] = df[c].astype(int)

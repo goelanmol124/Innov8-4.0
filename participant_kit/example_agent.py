@@ -25,7 +25,7 @@ def run_agent(df: pd.DataFrame, oracle_fn, budget: int) -> np.ndarray:
     Parameters
     ----------
     df : pd.DataFrame
-        Full dataset — 10,000 rows of features, NO labels.
+        Full dataset — 10,000 rows of candidate profile features, NO labels.
         Do not add a label column to this DataFrame.
 
     oracle_fn : callable
@@ -46,7 +46,7 @@ def run_agent(df: pd.DataFrame, oracle_fn, budget: int) -> np.ndarray:
     Returns
     -------
     np.ndarray of shape (len(df),)
-        Predicted labels — 0 (legitimate) or 1 (fraud) — for every row.
+        Predicted labels — 0 (legitimate candidate) or 1 (fraudulent) — for every row.
         If you return fewer than len(df) predictions, remaining rows are
         treated as 0. Float probabilities are accepted (threshold = 0.5).
     """
@@ -54,7 +54,9 @@ def run_agent(df: pd.DataFrame, oracle_fn, budget: int) -> np.ndarray:
 
     # ── Step 1: choose which rows to label ───────────────────────────────────
     # Baseline: pick randomly. A better strategy would use the feature space
-    # structure to identify diverse or high-information regions.
+    # structure to identify diverse or high-information regions — for example,
+    # targeting rows with high institution_risk_score, extreme application
+    # velocity, or suspicious copy_paste_ratio.
     query_indices = np.random.choice(n, size=budget, replace=False).tolist()
 
     # ── Step 2: query the oracle ──────────────────────────────────────────────
@@ -71,7 +73,7 @@ def run_agent(df: pd.DataFrame, oracle_fn, budget: int) -> np.ndarray:
 
     clf = LogisticRegression(
         max_iter=1000,
-        class_weight="balanced",  # important: fraud is rare
+        class_weight="balanced",  # important: fraud is rare (~8%)
         C=1.0,
         solver="lbfgs",
     )
