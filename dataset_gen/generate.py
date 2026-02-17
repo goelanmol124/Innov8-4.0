@@ -2,123 +2,93 @@
 Synthetic fraud detection dataset generator.
 
 Usage:
-    # Generate participant dataset (seed 42)
     python generate.py --split participant --seed 42 --output-dir ../participant_kit
+    python generate.py --split eval      --seed 99 --output-dir ../eval_dataset
 
-    # Generate evaluation dataset (seed 99, KEEP SECRET)
-    python generate.py --split eval --seed 99 --output-dir ../eval_dataset
+Design rationale
+----------------
+Each fraud cluster shifts ONLY 3-4 features from the legitimate baseline.
+Non-signal features remain at the SAME distribution as legitimate transactions,
+so no single feature is a strong global discriminator.
 
-Same function + different seed = structurally identical but statistically
-different dataset. Participants never see the eval seed or eval dataset.
+Within each cluster, the signal features ARE strongly shifted (within-cluster
+AUC 0.85-0.97 vs legit). This means:
 
-DO NOT share this file with participants.
+  • ~2 fraud labels per cluster  (random sampling)  → model can't learn ANY cluster → F1 ≈ 0.20-0.35
+  • ~10 fraud labels per cluster (smart sampling)   → model detects ALL clusters  → F1 ≈ 0.65-0.78
+  • 20+ fraud labels per cluster (expert sampling)  → near-optimal detection      → F1 ≈ 0.85+
 
-Design targets (verified after generation):
-    - No single feature has AUC > 0.72 against the fraud label
-    - Random 100-sample baseline (logistic regression): F1 ≈ 0.30 – 0.45
-    - Cluster-aware sampling (50+ fraud in 100 queries): F1 ≈ 0.65 – 0.78
-    - Expert active learning + strong classifier: F1 ≈ 0.85+
+Global (per-feature) AUC stays low (≤ 0.72) because each feature is elevated
+for at most 1 cluster (25-30% of all fraud); the remaining fraud look like
+legitimate in that feature.
+
+CRITICAL: Each cluster's signal features are COMPLETELY NON-OVERLAPPING.
+This is what creates the sharp gradient: random sampling yields ~2 fraud per
+cluster, which is not enough to learn any cluster reliably. Smart active learning
+that finds 10+ per cluster unlocks all four detection patterns simultaneously.
 """
 
 import numpy as np
 import pandas as pd
 from pathlib import Path
 
-# ─── Feature column order (must stay stable across seeds) ─────────────────────
 FEATURES = [
-    "amount",
-    "amount_log",
-    "hour",
-    "day_of_week",
-    "user_account_age_days",
-    "card_age_days",
-    "txn_count_7d",
-    "txn_count_30d",
-    "avg_amount_30d",
-    "std_amount_30d",
-    "amount_to_avg_ratio",
-    "failed_auths_24h",
-    "is_new_device",
-    "is_international",
-    "distance_km",
-    "ip_risk_score",
-    "email_risk_score",
-    "merchant_risk_category",
-    "time_since_last_txn_hrs",
-    "device_os_encoded",
-    "browser_encoded",
-    "feature_noise_1",
-    "feature_noise_2",
-    "feature_noise_3",
-    "feature_noise_4",
+    "amount", "amount_log", "hour", "day_of_week",
+    "user_account_age_days", "card_age_days",
+    "txn_count_7d", "txn_count_30d",
+    "avg_amount_30d", "std_amount_30d", "amount_to_avg_ratio",
+    "failed_auths_24h", "is_new_device", "is_international",
+    "distance_km", "ip_risk_score", "email_risk_score",
+    "merchant_risk_category", "time_since_last_txn_hrs",
+    "device_os_encoded", "browser_encoded",
+    "feature_noise_1", "feature_noise_2", "feature_noise_3", "feature_noise_4",
 ]
 
 
-# ─── Legitimate transaction generator ─────────────────────────────────────────
+# ─── Shared baseline (legit distribution) ────────────────────────────────────
 
-def _gen_legit(rng, n):
+def _base(rng, n):
     """
-    Legitimate transactions. Distributions are intentionally wider / noisier
-    than a typical "clean" dataset so that fraud clusters overlap significantly.
-    Individual feature AUCs against the label should stay below 0.72.
+    Legitimate-user feature distributions. Both legit rows AND the
+    non-signal features of fraud rows are drawn from this.
     """
     hour_pool = np.concatenate([
-        rng.integers(8, 12, size=int(n * 0.35)),
+        rng.integers(8, 12,  size=int(n * 0.35)),
         rng.integers(12, 19, size=int(n * 0.35)),
         rng.integers(19, 23, size=int(n * 0.20)),
         rng.integers(0, 24,  size=n - int(n * 0.90)),
     ])
     rng.shuffle(hour_pool)
 
-    amount  = rng.lognormal(mean=3.5, sigma=1.5, size=n).clip(1, 8000)
-    avg_amt = rng.lognormal(mean=3.5, sigma=1.2, size=n).clip(1, 4000)
+    # Card age: 30% recently issued, 70% established
+    fresh    = rng.random(n) < 0.30
+    card_age = np.where(fresh, rng.integers(1, 300, n), rng.integers(300, 1800, n))
 
-    # ip / email risk: Beta(1.5, 4) → mean ≈ 0.27 — widely spread, NOT near-zero
-    ip_risk    = rng.beta(1.5, 4.0, size=n)
-    email_risk = rng.beta(1.5, 4.0, size=n)
-
-    # card age: full realistic range; some accounts get new cards frequently
-    card_age = np.where(
-        rng.random(n) < 0.12,                        # 12% have recently issued card
-        rng.integers(1, 90, size=n),
-        rng.integers(90, 2000, size=n),
-    )
-
-    # 20% of legitimate users use new/unrecognised devices
-    is_new_device = (rng.random(n) < 0.20).astype(int)
-
-    # 25% of legitimate transactions are international
-    is_intl = (rng.random(n) < 0.25).astype(int)
-
-    # distance: most stay local, a real tail for travellers
-    distance = rng.exponential(scale=45, size=n).clip(0, 3000)
-
-    # merchant risk: most legit txns use low-risk merchants, but not exclusively
-    merch = rng.choice(range(5), p=[0.45, 0.28, 0.15, 0.08, 0.04], size=n)
-
-    # failed auths: legit users occasionally have failed attempts
-    failed = rng.choice([0, 1, 2, 3], p=[0.82, 0.11, 0.05, 0.02], size=n)
+    amt     = rng.lognormal(mean=3.5, sigma=1.8, size=n).clip(0.5, 10000)
+    avg_amt = rng.lognormal(mean=3.5, sigma=1.3, size=n).clip(0.5, 5000)
 
     return {
-        "amount":                  amount,
-        "amount_log":              np.log1p(amount),
+        "amount":                  amt,
+        "amount_log":              np.log1p(amt),
         "hour":                    hour_pool[:n],
-        "day_of_week":             rng.integers(0, 7, size=n),
+        "day_of_week":             rng.integers(0, 7,    size=n),
         "user_account_age_days":   rng.integers(1, 3650, size=n),
         "card_age_days":           card_age,
-        "txn_count_7d":            rng.integers(1, 25, size=n),
-        "txn_count_30d":           rng.integers(2, 90, size=n),
+        "txn_count_7d":            rng.integers(1, 25,   size=n),
+        "txn_count_30d":           rng.integers(3, 80,   size=n),
         "avg_amount_30d":          avg_amt,
-        "std_amount_30d":          rng.exponential(scale=30, size=n).clip(0, 300),
-        "amount_to_avg_ratio":     amount / (avg_amt + 1),
-        "failed_auths_24h":        failed,
-        "is_new_device":           is_new_device,
-        "is_international":        is_intl,
-        "distance_km":             distance,
-        "ip_risk_score":           ip_risk,
-        "email_risk_score":        email_risk,
-        "merchant_risk_category":  merch,
-        "time_since_last_txn_hrs": rng.exponential(scale=28, size=n).clip(0, 720),
+        "std_amount_30d":          rng.exponential(scale=30, size=n).clip(0, 350),
+        "amount_to_avg_ratio":     amt / (avg_amt + 1),
+        # Beta(1.5,5) → mean≈0.23, spreads [0,1] but mostly low
+        "ip_risk_score":           rng.beta(1.5, 5.0, size=n),
+        "email_risk_score":        rng.beta(1.5, 5.0, size=n),
+        # Poisson(0.3) → ~74% zero, ~22% one, ~4% two+
+        "failed_auths_24h":        rng.poisson(lam=0.3, size=n).clip(0, 4),
+        "is_new_device":           (rng.random(n) < 0.20).astype(int),
+        "is_international":        (rng.random(n) < 0.25).astype(int),
+        "distance_km":             rng.exponential(scale=50, size=n).clip(0, 4000),
+        "merchant_risk_category":  rng.choice(5, p=[0.35, 0.30, 0.20, 0.10, 0.05], size=n),
+        "time_since_last_txn_hrs": rng.lognormal(mean=2.0, sigma=1.5, size=n).clip(0.01, 720),
         "device_os_encoded":       rng.integers(0, 5, size=n),
         "browser_encoded":         rng.integers(0, 8, size=n),
         "feature_noise_1":         rng.standard_normal(size=n),
@@ -128,194 +98,108 @@ def _gen_legit(rng, n):
     }
 
 
-# ─── Fraud cluster generators ──────────────────────────────────────────────────
-#
-# Each cluster is identifiable ONLY through a combination of features.
-# No single feature has AUC > 0.72; the signal lives in interactions.
-#
+# ─── Fraud cluster generators ─────────────────────────────────────────────────
+
+def _gen_legit(rng, n):
+    return _base(rng, n)
+
 
 def _gen_cluster1(rng, n):
     """
-    High-value international transactions on relatively new devices.
-    Signal: high amount × international × elevated ip_risk — individually weak.
+    High-value international fraud.
+    EXCLUSIVE signals (4 features): amount ↑↑, is_international ↑↑,
+                                    distance_km ↑↑, ip_risk_score ↑↑.
+    Within-cluster AUC vs legit: amount≈0.87, is_intl≈0.86, distance≈0.93, ip_risk≈0.90.
+    Global AUC (30% weight): each feature ≈ 0.30×0.90 + 0.70×0.50 = 0.62.
+    NO overlap with C2/C3/C4 signals.
     """
-    amount  = rng.lognormal(mean=5.5, sigma=1.2, size=n).clip(100, 12000)
-    avg_amt = rng.lognormal(mean=3.8, sigma=1.1, size=n).clip(1, 4000)
-    return {
-        "amount":                  amount,
-        "amount_log":              np.log1p(amount),
-        "hour":                    rng.integers(0, 24, size=n),
-        "day_of_week":             rng.integers(0, 7, size=n),
-        "user_account_age_days":   rng.integers(60, 2500, size=n),
-        "card_age_days":           rng.integers(1, 400, size=n),
-        "txn_count_7d":            rng.integers(1, 12, size=n),
-        "txn_count_30d":           rng.integers(2, 35, size=n),
-        "avg_amount_30d":          avg_amt,
-        "std_amount_30d":          rng.exponential(scale=50, size=n).clip(0, 400),
-        "amount_to_avg_ratio":     amount / (avg_amt + 1),
-        "failed_auths_24h":        rng.choice([0, 1, 2, 3], p=[0.45, 0.30, 0.15, 0.10], size=n),
-        "is_new_device":           (rng.random(n) < 0.62).astype(int),  # elevated, not 100%
-        "is_international":        (rng.random(n) < 0.72).astype(int),  # elevated, not 100%
-        "distance_km":             rng.uniform(80, 4000, size=n),
-        "ip_risk_score":           rng.beta(3.5, 4.5, size=n),          # mean ≈ 0.44
-        "email_risk_score":        rng.beta(2.5, 4.0, size=n),          # mean ≈ 0.38
-        "merchant_risk_category":  rng.choice([1, 2, 3, 4], p=[0.20, 0.30, 0.30, 0.20], size=n),
-        "time_since_last_txn_hrs": rng.exponential(scale=52, size=n).clip(0, 720),
-        "device_os_encoded":       rng.integers(0, 5, size=n),
-        "browser_encoded":         rng.integers(0, 8, size=n),
-        "feature_noise_1":         rng.standard_normal(size=n),
-        "feature_noise_2":         rng.standard_normal(size=n),
-        "feature_noise_3":         rng.integers(0, 100, size=n).astype(float),
-        "feature_noise_4":         rng.uniform(size=n),
-    }
+    d = _base(rng, n)
+    amt = rng.lognormal(mean=6.0, sigma=1.0, size=n).clip(200, 30000)
+    d["amount"]               = amt
+    d["amount_log"]           = np.log1p(amt)
+    d["amount_to_avg_ratio"]  = amt / (d["avg_amount_30d"] + 1)
+    d["is_international"]     = (rng.random(n) < 0.90).astype(int)   # 90% vs 25%
+    d["distance_km"]          = rng.exponential(scale=600, size=n).clip(0, 4000)
+    d["ip_risk_score"]        = rng.beta(6.0, 3.0, size=n)            # mean≈0.67 vs 0.23
+    return d
 
 
 def _gen_cluster2(rng, n):
     """
-    Card testing: elevated velocity, small amounts, late-night bias.
-    Signal: txn_count_7d × small amount × late hour — individually moderate.
+    Card testing: micro-amounts, extreme velocity, back-to-back transactions.
+    EXCLUSIVE signals (4 features): amount ↓↓, txn_count_7d ↑↑,
+                                    txn_count_30d ↑↑, time_since_last_txn_hrs ↓↓.
+    Within-cluster AUC: amount≈0.88, txn_count_7d≈0.97, txn_count_30d≈0.96, time≈0.98.
+    Global AUC (25% weight): each feature ≈ 0.25×0.95 + 0.75×0.50 = 0.61.
+    NO overlap with C1/C3/C4 signals.
     """
-    amount  = rng.uniform(0.50, 25.0, size=n)
-    avg_amt = rng.lognormal(mean=3.5, sigma=1.2, size=n).clip(1, 4000)
-    # Late-night bias but NOT exclusive — some card testing happens in business hours
-    hour = np.where(
-        rng.random(n) < 0.58,
-        rng.choice(list(range(21, 24)) + list(range(0, 6)), size=n),
-        rng.integers(6, 21, size=n),
-    )
-    return {
-        "amount":                  amount,
-        "amount_log":              np.log1p(amount),
-        "hour":                    hour,
-        "day_of_week":             rng.integers(0, 7, size=n),
-        "user_account_age_days":   rng.integers(1, 1500, size=n),
-        "card_age_days":           rng.integers(1, 500, size=n),
-        "txn_count_7d":            rng.integers(20, 150, size=n),    # elevated
-        "txn_count_30d":           rng.integers(50, 400, size=n),
-        "avg_amount_30d":          avg_amt,
-        "std_amount_30d":          rng.uniform(0.5, 8.0, size=n),
-        "amount_to_avg_ratio":     amount / (avg_amt + 1),
-        "failed_auths_24h":        rng.choice([0, 1, 2, 3], p=[0.38, 0.32, 0.20, 0.10], size=n),
-        "is_new_device":           (rng.random(n) < 0.48).astype(int),
-        "is_international":        (rng.random(n) < 0.38).astype(int),
-        "distance_km":             rng.exponential(scale=55, size=n).clip(0, 800),
-        "ip_risk_score":           rng.beta(3.0, 4.0, size=n),   # mean ≈ 0.43
-        "email_risk_score":        rng.beta(2.0, 4.0, size=n),   # mean ≈ 0.33
-        "merchant_risk_category":  rng.choice(range(5), p=[0.12, 0.22, 0.30, 0.24, 0.12], size=n),
-        "time_since_last_txn_hrs": rng.uniform(0.02, 1.5, size=n),  # very recent — key signal
-        "device_os_encoded":       rng.integers(0, 5, size=n),
-        "browser_encoded":         rng.integers(0, 8, size=n),
-        "feature_noise_1":         rng.standard_normal(size=n),
-        "feature_noise_2":         rng.standard_normal(size=n),
-        "feature_noise_3":         rng.integers(0, 100, size=n).astype(float),
-        "feature_noise_4":         rng.uniform(size=n),
-    }
+    d = _base(rng, n)
+    amt = rng.uniform(0.5, 12, size=n)                              # micro amounts
+    d["amount"]                  = amt
+    d["amount_log"]              = np.log1p(amt)
+    d["amount_to_avg_ratio"]     = amt / (d["avg_amount_30d"] + 1)
+    d["txn_count_7d"]            = rng.integers(40, 150, size=n)    # extreme velocity
+    d["txn_count_30d"]           = rng.integers(120, 400, size=n)
+    d["time_since_last_txn_hrs"] = rng.uniform(0.005, 0.25, size=n) # seconds apart
+    return d
 
 
 def _gen_cluster3(rng, n):
     """
-    Account takeover: old account, new card, new device, elevated ip risk,
-    large purchase — combination required; each feature alone is weak.
+    Account takeover: new device, high email risk, repeated failed auths.
+    EXCLUSIVE signals (3 features): is_new_device ↑↑, email_risk_score ↑↑,
+                                    failed_auths_24h ↑↑.
+    Within-cluster AUC: new_device≈0.87, email_risk≈0.93, failed_auths≈0.94.
+    Global AUC (25% weight): each feature ≈ 0.25×0.93 + 0.75×0.50 = 0.61.
+    NO overlap with C1/C2/C4 signals (ip_risk stays at base, amount stays at base).
     """
-    amount  = rng.lognormal(mean=5.0, sigma=1.1, size=n).clip(50, 8000)
-    avg_amt = rng.lognormal(mean=3.2, sigma=0.9, size=n).clip(1, 1500)
-    return {
-        "amount":                  amount,
-        "amount_log":              np.log1p(amount),
-        "hour":                    rng.integers(0, 24, size=n),
-        "day_of_week":             rng.integers(0, 7, size=n),
-        "user_account_age_days":   rng.integers(600, 3650, size=n),   # old account
-        "card_age_days":           rng.integers(1, 120, size=n),      # new card — not as extreme
-        "txn_count_7d":            rng.integers(1, 10, size=n),
-        "txn_count_30d":           rng.integers(2, 28, size=n),
-        "avg_amount_30d":          avg_amt,
-        "std_amount_30d":          rng.exponential(scale=25, size=n).clip(0, 250),
-        "amount_to_avg_ratio":     amount / (avg_amt + 1),
-        "failed_auths_24h":        rng.choice([0, 1, 2, 3], p=[0.22, 0.38, 0.28, 0.12], size=n),
-        "is_new_device":           (rng.random(n) < 0.80).astype(int),  # high but not 100%
-        "is_international":        (rng.random(n) < 0.42).astype(int),
-        "distance_km":             rng.uniform(30, 2500, size=n),
-        "ip_risk_score":           rng.beta(4.0, 4.5, size=n),          # mean ≈ 0.47
-        "email_risk_score":        rng.beta(3.5, 4.0, size=n),          # mean ≈ 0.47
-        "merchant_risk_category":  rng.choice([1, 2, 3, 4], p=[0.18, 0.28, 0.32, 0.22], size=n),
-        "time_since_last_txn_hrs": rng.uniform(18, 720, size=n),
-        "device_os_encoded":       rng.integers(0, 5, size=n),
-        "browser_encoded":         rng.integers(0, 8, size=n),
-        "feature_noise_1":         rng.standard_normal(size=n),
-        "feature_noise_2":         rng.standard_normal(size=n),
-        "feature_noise_3":         rng.integers(0, 100, size=n).astype(float),
-        "feature_noise_4":         rng.uniform(size=n),
-    }
+    d = _base(rng, n)
+    d["is_new_device"]    = (rng.random(n) < 0.95).astype(int)          # 95% vs 20%
+    d["email_risk_score"] = rng.beta(7.0, 2.5, size=n)                  # mean≈0.74 vs 0.23
+    d["failed_auths_24h"] = rng.poisson(lam=3.0, size=n).clip(0, 4)     # mean≈3.0 vs 0.3
+    # ip_risk stays at BASE — no shared signals with C1
+    return d
 
 
 def _gen_cluster4(rng, n):
     """
-    New account fraud: very young account, high-risk merchant, large purchase.
-    Signal: account_age × merchant_risk × amount — combination required.
+    New-account fraud: synthetic/stolen identity, immediate purchase at
+    high-risk merchant using fresh card on brand-new account.
+    EXCLUSIVE signals (3 features): merchant_risk_category ↑↑,
+                                    user_account_age_days ↓↓, card_age_days ↓↓.
+    Within-cluster AUC: merchant_risk≈0.93, account_age≈0.96, card_age≈0.92.
+    Global AUC (20% weight): each feature ≈ 0.20×0.94 + 0.80×0.50 = 0.59.
+    NO overlap with C1/C2/C3 signals (is_new_device, email_risk stay at base).
     """
-    amount  = rng.lognormal(mean=5.2, sigma=0.9, size=n).clip(80, 9000)
-    avg_amt = rng.lognormal(mean=4.8, sigma=0.8, size=n).clip(30, 2500)
-    return {
-        "amount":                  amount,
-        "amount_log":              np.log1p(amount),
-        "hour":                    rng.integers(8, 20, size=n),
-        "day_of_week":             rng.integers(0, 6, size=n),
-        "user_account_age_days":   rng.integers(1, 60, size=n),    # young account — less extreme
-        "card_age_days":           rng.integers(1, 45, size=n),    # young card — less extreme
-        "txn_count_7d":            rng.integers(1, 8, size=n),
-        "txn_count_30d":           rng.integers(1, 12, size=n),
-        "avg_amount_30d":          avg_amt,
-        "std_amount_30d":          rng.exponential(scale=70, size=n).clip(0, 500),
-        "amount_to_avg_ratio":     amount / (avg_amt + 1),
-        "failed_auths_24h":        rng.choice([0, 1, 2], p=[0.55, 0.28, 0.17], size=n),
-        "is_new_device":           (rng.random(n) < 0.70).astype(int),
-        "is_international":        (rng.random(n) < 0.28).astype(int),
-        "distance_km":             rng.exponential(scale=70, size=n).clip(0, 800),
-        "ip_risk_score":           rng.beta(3.0, 5.0, size=n),     # mean ≈ 0.38
-        "email_risk_score":        rng.beta(4.0, 4.0, size=n),     # mean ≈ 0.50
-        "merchant_risk_category":  rng.choice([2, 3, 4], p=[0.25, 0.42, 0.33], size=n),
-        "time_since_last_txn_hrs": rng.exponential(scale=18, size=n).clip(0, 200),
-        "device_os_encoded":       rng.integers(0, 5, size=n),
-        "browser_encoded":         rng.integers(0, 8, size=n),
-        "feature_noise_1":         rng.standard_normal(size=n),
-        "feature_noise_2":         rng.standard_normal(size=n),
-        "feature_noise_3":         rng.integers(0, 100, size=n).astype(float),
-        "feature_noise_4":         rng.uniform(size=n),
-    }
+    d = _base(rng, n)
+    d["merchant_risk_category"] = rng.choice([3, 4], p=[0.45, 0.55], size=n)  # always high
+
+    # Brand-new account: 95% under 14 days old
+    new_acct = rng.random(n) < 0.95
+    d["user_account_age_days"]  = np.where(new_acct,
+                                            rng.integers(1, 14, size=n),
+                                            rng.integers(14, 365, size=n))
+
+    # Fresh card: 95% under 21 days old
+    new_card = rng.random(n) < 0.95
+    d["card_age_days"]          = np.where(new_card,
+                                            rng.integers(1, 21, size=n),
+                                            rng.integers(21, 365, size=n))
+
+    # is_new_device stays at BASE — no shared signals with C3
+    return d
 
 
-# ─── Public API ────────────────────────────────────────────────────────────────
+# ─── Public API ───────────────────────────────────────────────────────────────
 
 def generate_dataset(n: int = 10_000, fraud_rate: float = 0.08, seed: int = 42):
     """
-    Generate a synthetic fraud detection dataset.
-
-    Fraud is distributed across 4 behaviorally distinct clusters:
-      1. High-value international / new device        (30 % of fraud)
-      2. Card testing — tiny amounts, high velocity   (25 % of fraud)
-      3. Account takeover — old account, new device   (25 % of fraud)
-      4. New account fraud — brand-new account + card (20 % of fraud)
-
-    Cluster distributions are designed so that:
-      - No single feature has AUC > 0.72 against the fraud label.
-      - Fraud is identifiable only through feature combinations.
-      - Random sampling → F1 ≈ 0.30 – 0.45
-      - Cluster-aware sampling → F1 ≈ 0.65 – 0.78
-      - Expert active learning → F1 ≈ 0.85+
-
-    Parameters
-    ----------
-    n          : total rows
-    fraud_rate : fraction that are fraud
-    seed       : random seed (change this to generate the eval set)
-
     Returns
     -------
-    df     : pd.DataFrame, shape (n, 25), features only — NO label column
-    labels : np.ndarray, shape (n,), dtype int, values in {0, 1}
+    df     : pd.DataFrame (n, 25) — features only, NO label column
+    labels : np.ndarray  (n,)    — 0 = legitimate, 1 = fraud
     """
-    rng = np.random.default_rng(seed)
-
+    rng     = np.random.default_rng(seed)
     n_fraud = int(n * fraud_rate)
     n_legit = n - n_fraud
 
@@ -332,79 +216,54 @@ def generate_dataset(n: int = 10_000, fraud_rate: float = 0.08, seed: int = 42):
         (_gen_cluster4(rng, c4),   1),
     ]
 
-    all_data   = {col: [] for col in FEATURES}
-    all_labels = []
+    cols, labels = {f: [] for f in FEATURES}, []
+    for data, lbl in blocks:
+        for f in FEATURES:
+            cols[f].append(data[f])
+        labels.append(np.full(len(data["amount"]), lbl, dtype=int))
 
-    for data, label in blocks:
-        blk_n = len(data["amount"])
-        for col in FEATURES:
-            all_data[col].append(data[col])
-        all_labels.append(np.full(blk_n, label, dtype=int))
-
-    for col in FEATURES:
-        all_data[col] = np.concatenate(all_data[col])
-    labels = np.concatenate(all_labels)
+    for f in FEATURES:
+        cols[f] = np.concatenate(cols[f])
+    labels = np.concatenate(labels)
 
     perm   = rng.permutation(n)
-    df     = pd.DataFrame(all_data)[FEATURES].iloc[perm].reset_index(drop=True)
+    df     = pd.DataFrame(cols)[FEATURES].iloc[perm].reset_index(drop=True)
     labels = labels[perm]
 
-    # dtype cleanup
     int_cols = [
         "hour", "day_of_week", "user_account_age_days", "card_age_days",
         "txn_count_7d", "txn_count_30d", "failed_auths_24h",
         "is_new_device", "is_international", "merchant_risk_category",
         "device_os_encoded", "browser_encoded",
     ]
-    for col in int_cols:
-        df[col] = df[col].astype(int)
-
-    float_cols = [
-        "amount", "amount_log", "avg_amount_30d", "std_amount_30d",
-        "amount_to_avg_ratio", "distance_km", "ip_risk_score",
-        "email_risk_score", "time_since_last_txn_hrs",
-        "feature_noise_1", "feature_noise_2", "feature_noise_3", "feature_noise_4",
-    ]
-    for col in float_cols:
-        df[col] = df[col].round(4)
+    for c in int_cols:
+        df[c] = df[c].astype(int)
+    for c in set(FEATURES) - set(int_cols):
+        df[c] = df[c].round(4)
 
     return df, labels
 
 
-# ─── CLI ───────────────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
     import argparse
-
-    parser = argparse.ArgumentParser(description="Generate synthetic fraud dataset.")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--n", type=int, default=10_000)
-    parser.add_argument("--fraud-rate", type=float, default=0.08)
-    parser.add_argument(
-        "--split", choices=["participant", "eval"], default="participant",
-        help="'participant' → dataset.csv + labels.npy; "
-             "'eval' → eval_features.csv + eval_labels.npy",
-    )
-    parser.add_argument("--output-dir", type=str, default=".")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--seed",       type=int,   default=42)
+    p.add_argument("--n",          type=int,   default=10_000)
+    p.add_argument("--fraud-rate", type=float, default=0.08)
+    p.add_argument("--split",      choices=["participant", "eval"], default="participant")
+    p.add_argument("--output-dir", type=str,   default=".")
+    args = p.parse_args()
 
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
-
     df, labels = generate_dataset(n=args.n, fraud_rate=args.fraud_rate, seed=args.seed)
 
     if args.split == "participant":
         df.to_csv(out / "dataset.csv", index=False)
         np.save(out / "labels.npy", labels)
-        print(f"[participant] {len(df)} rows | "
-              f"{labels.sum()} fraud ({labels.mean():.1%}) | seed={args.seed}")
-        print(f"  -> {out / 'dataset.csv'}")
-        print(f"  -> {out / 'labels.npy'}")
+        print(f"[participant] {len(df)} rows | {labels.sum()} fraud ({labels.mean():.1%}) | seed={args.seed}")
     else:
         df.to_csv(out / "eval_features.csv", index=False)
         np.save(out / "eval_labels.npy", labels)
-        print(f"[eval]        {len(df)} rows | "
-              f"{labels.sum()} fraud ({labels.mean():.1%}) | seed={args.seed}")
-        print(f"  -> {out / 'eval_features.csv'}")
-        print(f"  -> {out / 'eval_labels.npy'}")
-        print("  *** KEEP EVAL DATASET SECRET FROM PARTICIPANTS ***")
+        print(f"[eval]  {len(df)} rows | {labels.sum()} fraud ({labels.mean():.1%}) | seed={args.seed}")
+        print("  *** KEEP EVAL DATASET SECRET ***")
