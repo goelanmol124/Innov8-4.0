@@ -93,6 +93,10 @@ class Oracle:
 
         n_rows = len(self._labels)
         for idx in indices:
+            if not isinstance(idx, (int, np.integer)):
+                raise TypeError(
+                    f"Index must be an integer, got {type(idx).__name__}: {idx!r}"
+                )
             if not (0 <= int(idx) < n_rows):
                 raise IndexError(
                     f"Index {idx} is out of range. "
@@ -106,6 +110,11 @@ class Oracle:
     def queries_used(self) -> int:
         """How many indices have been queried so far."""
         return self._used
+
+    @property
+    def budget(self) -> int:
+        """Maximum total indices allowed."""
+        return self._budget
 
     @property
     def budget_remaining(self) -> int:
