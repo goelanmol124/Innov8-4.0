@@ -107,86 +107,110 @@ def _gen_legit(rng, n):
 def _gen_cluster1(rng, n):
     """
     High-value international fraud.
-    EXCLUSIVE signals (4 features): amount ↑↑, is_international ↑↑,
-                                    distance_km ↑↑, ip_risk_score ↑↑.
-    Within-cluster AUC vs legit: amount≈0.87, is_intl≈0.86, distance≈0.93, ip_risk≈0.90.
-    Global AUC (30% weight): each feature ≈ 0.30×0.90 + 0.70×0.50 = 0.62.
+    EXCLUSIVE signals: amount ↑↑, is_international ↑↑, distance_km ↑↑, ip_risk_score ↑↑.
+    PARTIAL PREVALENCE: only 60% of C1 fraud rows have these signals elevated.
+    The remaining 40% draw from the base (legit) distribution, making them
+    indistinguishable from legitimate transactions on individual features.
+
+    This requires ~10+ labeled C1 samples to reliably detect the cluster;
+    with only 2 samples, expected 1.2 have the signal — not enough to generalise.
+
+    Global AUC (30% cluster weight, 60% prevalence):
+        each feature ≈ 0.30×0.60×0.90 + 0.70×0.50 + 0.30×0.40×0.50 ≈ 0.57
     NO overlap with C2/C3/C4 signals.
     """
-    d = _base(rng, n)
-    amt = rng.lognormal(mean=6.0, sigma=1.0, size=n).clip(200, 30000)
-    d["amount"]               = amt
-    d["amount_log"]           = np.log1p(amt)
-    d["amount_to_avg_ratio"]  = amt / (d["avg_amount_30d"] + 1)
-    d["is_international"]     = (rng.random(n) < 0.90).astype(int)   # 90% vs 25%
-    d["distance_km"]          = rng.exponential(scale=600, size=n).clip(0, 4000)
-    d["ip_risk_score"]        = rng.beta(6.0, 3.0, size=n)            # mean≈0.67 vs 0.23
+    d   = _base(rng, n)
+    sig = rng.random(n) < 0.60  # only 60% have the cluster signal
+
+    amt                        = np.where(sig,
+                                          rng.lognormal(mean=6.0, sigma=1.0, size=n).clip(200, 30000),
+                                          d["amount"])
+    d["amount"]                = amt
+    d["amount_log"]            = np.log1p(amt)
+    d["amount_to_avg_ratio"]   = amt / (d["avg_amount_30d"] + 1)
+    d["is_international"]      = np.where(sig,
+                                          (rng.random(n) < 0.92).astype(int),
+                                          d["is_international"])
+    d["distance_km"]           = np.where(sig,
+                                          rng.exponential(scale=600, size=n).clip(0, 4000),
+                                          d["distance_km"])
+    d["ip_risk_score"]         = np.where(sig,
+                                          rng.beta(6.0, 3.0, size=n),   # mean≈0.67
+                                          d["ip_risk_score"])
     return d
 
 
 def _gen_cluster2(rng, n):
     """
     Card testing: micro-amounts, extreme velocity, back-to-back transactions.
-    EXCLUSIVE signals (4 features): amount ↓↓, txn_count_7d ↑↑,
-                                    txn_count_30d ↑↑, time_since_last_txn_hrs ↓↓.
-    Within-cluster AUC: amount≈0.88, txn_count_7d≈0.97, txn_count_30d≈0.96, time≈0.98.
-    Global AUC (25% weight): each feature ≈ 0.25×0.95 + 0.75×0.50 = 0.61.
+    EXCLUSIVE signals: amount ↓↓, txn_count_7d ↑↑, txn_count_30d ↑↑, time_since ↓↓.
+    PARTIAL PREVALENCE: 60% of C2 fraud rows have these signals.
+
+    Global AUC (25% cluster weight, 60% prevalence):
+        each feature ≈ 0.25×0.60×0.95 + 0.75×0.50 + 0.25×0.40×0.50 ≈ 0.57
     NO overlap with C1/C3/C4 signals.
     """
-    d = _base(rng, n)
-    amt = rng.uniform(0.5, 12, size=n)                              # micro amounts
+    d   = _base(rng, n)
+    sig = rng.random(n) < 0.60
+
+    amt                          = np.where(sig, rng.uniform(0.5, 12, size=n), d["amount"])
     d["amount"]                  = amt
     d["amount_log"]              = np.log1p(amt)
     d["amount_to_avg_ratio"]     = amt / (d["avg_amount_30d"] + 1)
-    d["txn_count_7d"]            = rng.integers(40, 150, size=n)    # extreme velocity
-    d["txn_count_30d"]           = rng.integers(120, 400, size=n)
-    d["time_since_last_txn_hrs"] = rng.uniform(0.005, 0.25, size=n) # seconds apart
+    d["txn_count_7d"]            = np.where(sig, rng.integers(40, 150, size=n), d["txn_count_7d"])
+    d["txn_count_30d"]           = np.where(sig, rng.integers(120, 400, size=n), d["txn_count_30d"])
+    d["time_since_last_txn_hrs"] = np.where(sig,
+                                            rng.uniform(0.005, 0.25, size=n),
+                                            d["time_since_last_txn_hrs"])
     return d
 
 
 def _gen_cluster3(rng, n):
     """
     Account takeover: new device, high email risk, repeated failed auths.
-    EXCLUSIVE signals (3 features): is_new_device ↑↑, email_risk_score ↑↑,
-                                    failed_auths_24h ↑↑.
-    Within-cluster AUC: new_device≈0.87, email_risk≈0.93, failed_auths≈0.94.
-    Global AUC (25% weight): each feature ≈ 0.25×0.93 + 0.75×0.50 = 0.61.
-    NO overlap with C1/C2/C4 signals (ip_risk stays at base, amount stays at base).
+    EXCLUSIVE signals: is_new_device ↑↑, email_risk_score ↑↑, failed_auths_24h ↑↑.
+    PARTIAL PREVALENCE: 60% of C3 fraud rows have these signals.
+
+    Global AUC (25% cluster weight, 60% prevalence):
+        each feature ≈ 0.25×0.60×0.92 + 0.75×0.50 + 0.25×0.40×0.50 ≈ 0.56
+    NO overlap with C1/C2/C4 signals (ip_risk stays at base).
     """
-    d = _base(rng, n)
-    d["is_new_device"]    = (rng.random(n) < 0.95).astype(int)          # 95% vs 20%
-    d["email_risk_score"] = rng.beta(7.0, 2.5, size=n)                  # mean≈0.74 vs 0.23
-    d["failed_auths_24h"] = rng.poisson(lam=3.0, size=n).clip(0, 4)     # mean≈3.0 vs 0.3
-    # ip_risk stays at BASE — no shared signals with C1
+    d   = _base(rng, n)
+    sig = rng.random(n) < 0.60
+
+    d["is_new_device"]    = np.where(sig, (rng.random(n) < 0.95).astype(int), d["is_new_device"])
+    d["email_risk_score"] = np.where(sig, rng.beta(7.0, 2.5, size=n), d["email_risk_score"])
+    d["failed_auths_24h"] = np.where(sig,
+                                     rng.poisson(lam=3.0, size=n).clip(0, 4),
+                                     d["failed_auths_24h"])
     return d
 
 
 def _gen_cluster4(rng, n):
     """
-    New-account fraud: synthetic/stolen identity, immediate purchase at
-    high-risk merchant using fresh card on brand-new account.
-    EXCLUSIVE signals (3 features): merchant_risk_category ↑↑,
-                                    user_account_age_days ↓↓, card_age_days ↓↓.
-    Within-cluster AUC: merchant_risk≈0.93, account_age≈0.96, card_age≈0.92.
-    Global AUC (20% weight): each feature ≈ 0.20×0.94 + 0.80×0.50 = 0.59.
+    New-account fraud: fresh identity, immediate high-risk purchase.
+    EXCLUSIVE signals: merchant_risk_category ↑↑, user_account_age_days ↓↓, card_age_days ↓↓.
+    PARTIAL PREVALENCE: 60% of C4 fraud rows have these signals.
+
+    Global AUC (20% cluster weight, 60% prevalence):
+        each feature ≈ 0.20×0.60×0.93 + 0.80×0.50 + 0.20×0.40×0.50 ≈ 0.55
     NO overlap with C1/C2/C3 signals (is_new_device, email_risk stay at base).
     """
-    d = _base(rng, n)
-    d["merchant_risk_category"] = rng.choice([3, 4], p=[0.45, 0.55], size=n)  # always high
+    d   = _base(rng, n)
+    sig = rng.random(n) < 0.60
 
-    # Brand-new account: 95% under 14 days old
+    d["merchant_risk_category"] = np.where(sig,
+                                            rng.choice([3, 4], p=[0.45, 0.55], size=n),
+                                            d["merchant_risk_category"])
+
     new_acct = rng.random(n) < 0.95
-    d["user_account_age_days"]  = np.where(new_acct,
-                                            rng.integers(1, 14, size=n),
-                                            rng.integers(14, 365, size=n))
+    young_acct = np.where(new_acct, rng.integers(1, 14, size=n), rng.integers(14, 365, size=n))
+    d["user_account_age_days"]  = np.where(sig, young_acct, d["user_account_age_days"])
 
-    # Fresh card: 95% under 21 days old
     new_card = rng.random(n) < 0.95
-    d["card_age_days"]          = np.where(new_card,
-                                            rng.integers(1, 21, size=n),
-                                            rng.integers(21, 365, size=n))
+    young_card = np.where(new_card, rng.integers(1, 21, size=n), rng.integers(21, 365, size=n))
+    d["card_age_days"]          = np.where(sig, young_card, d["card_age_days"])
 
-    # is_new_device stays at BASE — no shared signals with C3
     return d
 
 
