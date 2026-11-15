@@ -37,3 +37,16 @@ Thumbs.db
 *.swo
 .idea/
 .vscode/
+
+# Secrets, caches and build artefacts
+.env
+.env.*
+!.env.example
+.dev.vars
+*.pem
+credentials*.json
+token*.json
+.pytest_cache/
+node_modules/
+.wrangler/
+*.log
