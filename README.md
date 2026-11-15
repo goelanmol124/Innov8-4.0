@@ -1,6 +1,6 @@
 # Innov8 4.0: Talent Fraud Detection with a Limited Label Budget
 
-An **active-learning hackathon challenge** I designed and ran for Innov8 4.0 at IIT Delhi, sponsored by Eightfold AI. Participants get 10,000 unlabelled candidate profiles and may query the ground-truth label for at most **100 rows**. How they spend that budget decides how well their fraud classifier does.
+An **active-learning hackathon challenge** built for Innov8 4.0 at IIT Delhi, sponsored by Eightfold AI. Participants get 10,000 unlabelled candidate profiles and may query the ground-truth label for at most **100 rows**. How they spend that budget decides how well their fraud classifier does.
 
 This repo holds the full challenge kit:
 
